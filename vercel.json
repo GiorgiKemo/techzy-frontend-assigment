@@ -1,0 +1,8 @@
+{
+  "buildCommand": "VITE_API_MODE=local npm run build",
+  "outputDirectory": "dist",
+  "framework": "vite",
+  "rewrites": [
+    { "source": "/((?!assets/).*)", "destination": "/index.html" }
+  ]
+}

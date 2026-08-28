@@ -57,3 +57,19 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
 .avatar-option:hover { transform: translateY(-1px); }
 .avatar-option.selected { border-color: #163b34; box-shadow: 0 0 0 3px #fff, 0 0 0 4px #8db3a0; }
 .profile-footer { margin-top: 20px; }
+.skip-link { position: absolute; left: 16px; top: -48px; z-index: 100; background: #163b34; color: #fff; padding: 8px 12px; border-radius: 6px; font-size: 12px; font-weight: 600; text-decoration: none; }
+.skip-link:focus { top: 12px; }
+.sidebar-user { display: flex; align-items: center; gap: 4px; border-top: 1px solid rgba(255,255,255,.13); padding: 8px 4px 4px; }
+.sidebar-profile-button { flex: 1; min-width: 0; display: flex; align-items: center; gap: 9px; border: 0; background: transparent; color: inherit; text-align: left; padding: 8px; border-radius: 8px; }
+.sidebar-profile-button:hover { background: rgba(255,255,255,.06); }
+.sidebar-profile-button > div:nth-child(2) { min-width: 0; flex: 1; }
+.sidebar-profile-button strong, .sidebar-profile-button span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.sidebar-profile-button strong { display: block; font-size: 11px; color: #eff6f1; }
+.sidebar-profile-button span { display: block; color: #8ba39b; font-size: 9px; margin-top: 3px; }
+.sidebar-logout { border: 0; background: transparent; color: #8ba39b; padding: 8px; border-radius: 8px; display: grid; place-items: center; }
+.sidebar-logout:hover { color: #fff; background: rgba(255,255,255,.06); }
+.trend-down { color: #b54c4a; font-family: 'DM Mono'; font-size: 10px; display: inline-flex; align-items: center; gap: 3px; }
+.trend-flat { color: #8a9690; font-family: 'DM Mono'; font-size: 10px; display: inline-flex; align-items: center; gap: 3px; }
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { animation: none !important; transition: none !important; }
+}

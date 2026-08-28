@@ -1,15 +1,30 @@
 export const SEED_BASE_DATE = '2025-03-18'
 
 export function getTodayDate() {
-  const today = new Date()
-  const year = today.getFullYear()
-  const month = String(today.getMonth() + 1).padStart(2, '0')
-  const day = String(today.getDate()).padStart(2, '0')
-  return `${year}-${month}-${day}`
+  return formatLocalDate(new Date())
+}
+
+export function getCurrentTime() {
+  const now = new Date()
+  return `${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}`
+}
+
+export function greetingForNow() {
+  const hour = new Date().getHours()
+  if (hour < 12) return 'Good morning'
+  if (hour < 17) return 'Good afternoon'
+  return 'Good evening'
 }
 
 export function parseDate(date: string) {
   return new Date(`${date}T12:00:00`)
+}
+
+function formatLocalDate(date: Date) {
+  const year = date.getFullYear()
+  const month = String(date.getMonth() + 1).padStart(2, '0')
+  const day = String(date.getDate()).padStart(2, '0')
+  return `${year}-${month}-${day}`
 }
 
 export function formatDate(date: string, options: Intl.DateTimeFormatOptions = {}) {
@@ -27,10 +42,18 @@ export function timeToMinutes(time: string) {
   return hours * 60 + minutes
 }
 
+export function getReferenceMinutes(date: string) {
+  return date === getTodayDate() ? timeToMinutes(getCurrentTime()) : 12 * 60
+}
+
 export function addDays(date: string, amount: number) {
   const next = parseDate(date)
   next.setDate(next.getDate() + amount)
-  return next.toISOString().slice(0, 10)
+  return formatLocalDate(next)
+}
+
+export function daysBetween(left: string, right: string) {
+  return Math.round((parseDate(left).getTime() - parseDate(right).getTime()) / 86400000)
 }
 
 export function startOfWeek(date: string) {
@@ -46,5 +69,14 @@ export function getWeekDates(date: string) {
 
 export function isUpcoming(date: string, start: string) {
   const today = getTodayDate()
-  return date > today || (date === today && timeToMinutes(start) >= 0)
+  if (date > today) return true
+  if (date < today) return false
+  return timeToMinutes(start) > timeToMinutes(getCurrentTime())
+}
+
+export function isPast(date: string, end: string) {
+  const today = getTodayDate()
+  if (date < today) return true
+  if (date > today) return false
+  return timeToMinutes(end) <= timeToMinutes(getCurrentTime())
 }

@@ -1,19 +1,30 @@
 import crypto from 'node:crypto'
 import fs from 'node:fs'
 import path from 'node:path'
+import { promisify } from 'node:util'
 import { fileURLToPath } from 'node:url'
 import express from 'express'
 
+const scrypt = promisify(crypto.scrypt)
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const rootDir = path.resolve(__dirname, '..')
 const runtimeDir = path.join(__dirname, 'data')
 const sourceDir = path.join(rootDir, 'src', 'data')
 const port = Number(process.env.PORT || 8787)
+const host = process.env.HOST || '0.0.0.0'
+const serveFrontendFlag = process.argv.includes('--serve-frontend')
+if (serveFrontendFlag && !process.env.NODE_ENV) process.env.NODE_ENV = 'production'
 const isProduction = process.env.NODE_ENV === 'production'
-const serveFrontend = isProduction || process.argv.includes('--serve-frontend')
+const serveFrontend = isProduction || serveFrontendFlag
 const SESSION_COOKIE = 'loop_session'
 const SESSION_TTL_MS = 7 * 24 * 60 * 60 * 1000
+const AUTH_WINDOW_MS = 15 * 60 * 1000
+const AUTH_ATTEMPT_LIMIT = 10
 const colors = ['#f1d2b9', '#c9e5e2', '#d9c9f0', '#d9e4b7', '#f0cdd3', '#cbd9ef']
+const dummyCredentials = {
+  salt: crypto.randomBytes(16).toString('base64'),
+  hash: crypto.randomBytes(64).toString('base64'),
+}
 
 fs.mkdirSync(runtimeDir, { recursive: true })
 
@@ -35,6 +46,13 @@ function writeJson(filePath, value) {
   fs.renameSync(temporaryPath, filePath)
 }
 
+let storeLock = Promise.resolve()
+function withStoreLock(fn) {
+  const run = storeLock.then(() => fn(), () => fn())
+  storeLock = run.then(() => undefined, () => undefined)
+  return run
+}
+
 function localDate(date = new Date()) {
   const year = date.getFullYear()
   const month = String(date.getMonth() + 1).padStart(2, '0')
@@ -45,7 +63,7 @@ function localDate(date = new Date()) {
 function shiftDate(date, days) {
   const shifted = new Date(`${date}T12:00:00`)
   shifted.setDate(shifted.getDate() + days)
-  return shifted.toISOString().slice(0, 10)
+  return localDate(shifted)
 }
 
 function daysBetween(left, right) {
@@ -55,7 +73,7 @@ function daysBetween(left, right) {
 function isValidDate(value) {
   if (!/^\d{4}-\d{2}-\d{2}$/.test(value)) return false
   const date = new Date(`${value}T12:00:00`)
-  return !Number.isNaN(date.getTime()) && date.toISOString().slice(0, 10) === value
+  return !Number.isNaN(date.getTime()) && localDate(date) === value
 }
 
 function initializeRuntimeData() {
@@ -97,7 +115,20 @@ function publicUser(user) {
 }
 
 function parseCookies(header = '') {
-  return Object.fromEntries(header.split(';').map((part) => part.trim().split('=').map(decodeURIComponent)).filter(([key]) => key))
+  const cookies = {}
+  for (const part of String(header).split(';')) {
+    const index = part.indexOf('=')
+    if (index === -1) continue
+    const key = part.slice(0, index).trim()
+    const value = part.slice(index + 1).trim()
+    if (!key) continue
+    try {
+      cookies[decodeURIComponent(key)] = decodeURIComponent(value)
+    } catch {
+      // Ignore malformed cookie pairs instead of failing the request.
+    }
+  }
+  return cookies
 }
 
 function setSessionCookie(res, token) {
@@ -121,11 +152,9 @@ function createSession(userId) {
 function authenticatedUser(req) {
   const token = parseCookies(req.headers.cookie)[SESSION_COOKIE]
   if (!token) return null
-  const sessions = getSessions()
-  const session = sessions.find((item) => item.token === token && item.expiresAt > Date.now())
+  const session = getSessions().find((item) => item.token === token && item.expiresAt > Date.now())
   if (!session) return null
-  const user = getUsers().find((item) => item.id === session.userId)
-  return user || null
+  return getUsers().find((item) => item.id === session.userId) || null
 }
 
 function requireAuth(req, res, next) {
@@ -136,16 +165,16 @@ function requireAuth(req, res, next) {
 }
 
 function validateEmail(email) {
-  return typeof email === 'string' && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)
+  return typeof email === 'string' && email.length <= 254 && /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)
 }
 
-function hashPassword(password, salt = crypto.randomBytes(16)) {
-  const derivedKey = crypto.scryptSync(password, salt, 64)
+async function hashPassword(password, salt = crypto.randomBytes(16)) {
+  const derivedKey = await scrypt(password, salt, 64)
   return { salt: salt.toString('base64'), hash: derivedKey.toString('base64') }
 }
 
-function verifyPassword(password, user) {
-  const { hash } = hashPassword(password, Buffer.from(user.salt, 'base64'))
+async function verifyPassword(password, user) {
+  const { hash } = await hashPassword(password, Buffer.from(user.salt, 'base64'))
   const expected = Buffer.from(user.hash, 'base64')
   const actual = Buffer.from(hash, 'base64')
   return expected.length === actual.length && crypto.timingSafeEqual(expected, actual)
@@ -159,6 +188,25 @@ function sendValidationError(res, message) {
   return res.status(400).json({ message })
 }
 
+function normalizeBooking(body, id, status) {
+  return {
+    id,
+    roomId: typeof body?.roomId === 'string' ? body.roomId : '',
+    title: typeof body?.title === 'string' ? body.title.trim() : '',
+    organizerId: typeof body?.organizerId === 'string' ? body.organizerId : '',
+    date: typeof body?.date === 'string' ? body.date : '',
+    start: typeof body?.start === 'string' ? body.start : '',
+    end: typeof body?.end === 'string' ? body.end : '',
+    attendees: Number(body?.attendees),
+    status,
+    notes: typeof body?.notes === 'string' ? body.notes.trim() : '',
+  }
+}
+
+function bookingStatus(value, fallback) {
+  return value === 'confirmed' || value === 'tentative' ? value : fallback
+}
+
 function validateBooking(booking, bookings, editingId = null) {
   if (!booking || typeof booking !== 'object') return 'Booking details are required.'
   if (typeof booking.title !== 'string' || !booking.title.trim() || booking.title.trim().length > 160) return 'Give your booking a title of up to 160 characters.'
@@ -169,9 +217,10 @@ function validateBooking(booking, bookings, editingId = null) {
   if (end <= start) return 'End time needs to be after the start time.'
   const room = getRooms().find((item) => item.id === booking.roomId)
   if (!room) return 'Choose an available room.'
-  if (!Number.isInteger(Number(booking.attendees)) || Number(booking.attendees) < 1) return 'Add at least one attendee.'
-  if (Number(booking.attendees) > room.capacity) return `This room fits up to ${room.capacity} people.`
+  if (!Number.isInteger(booking.attendees) || booking.attendees < 1) return 'Add at least one attendee.'
+  if (booking.attendees > room.capacity) return `This room fits up to ${room.capacity} people.`
   if (typeof booking.notes !== 'string' || booking.notes.length > 2000) return 'Notes can be up to 2,000 characters.'
+  if (booking.status !== 'confirmed' && booking.status !== 'tentative') return 'Choose a valid booking status.'
   if (!getEmployees().some((item) => item.id === booking.organizerId) && !getUsers().some((item) => item.id === booking.organizerId)) return 'Choose a valid organizer.'
   const duplicate = bookings.some((item) => item.id !== editingId && item.status !== 'cancelled' && item.roomId === booking.roomId && item.date === booking.date && start < timeToMinutes(item.end) && end > timeToMinutes(item.start))
   if (duplicate) return 'That room is already booked during this time.'
@@ -182,67 +231,133 @@ function timeToMinutes(value) {
   return Number(value.slice(0, 2)) * 60 + Number(value.slice(3))
 }
 
+const rateBuckets = new Map()
+setInterval(() => {
+  const now = Date.now()
+  for (const [key, bucket] of rateBuckets) {
+    if (now > bucket.resetAt) rateBuckets.delete(key)
+  }
+}, 60_000).unref()
+
+function clientKey(req) {
+  return req.ip || req.socket.remoteAddress || 'unknown'
+}
+
+function rateLimit(key, limit, windowMs) {
+  const now = Date.now()
+  const bucket = rateBuckets.get(key)
+  if (!bucket || now > bucket.resetAt) {
+    rateBuckets.set(key, { count: 1, resetAt: now + windowMs })
+    return true
+  }
+  bucket.count += 1
+  return bucket.count <= limit
+}
+
+function limitAuth(req, res, next) {
+  if (!rateLimit(`auth:${clientKey(req)}`, AUTH_ATTEMPT_LIMIT, AUTH_WINDOW_MS)) {
+    res.setHeader('Retry-After', '900')
+    return res.status(429).json({ message: 'Too many attempts. Try again in a few minutes.' })
+  }
+  return next()
+}
+
+function asyncHandler(fn) {
+  return (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next)
+}
+
 const app = express()
+app.disable('x-powered-by')
+if (process.env.TRUST_PROXY === '1') app.set('trust proxy', 1)
 app.use(express.json({ limit: '32kb' }))
 app.use((_req, res, next) => {
   res.setHeader('X-Content-Type-Options', 'nosniff')
   res.setHeader('X-Frame-Options', 'DENY')
   res.setHeader('Referrer-Policy', 'same-origin')
+  res.setHeader('Permissions-Policy', 'camera=(), microphone=(), geolocation=()')
+  res.setHeader('Cross-Origin-Opener-Policy', 'same-origin')
+  res.setHeader('Cross-Origin-Resource-Policy', 'same-origin')
+  res.setHeader('Content-Security-Policy', "default-src 'self'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'; script-src 'self'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; img-src 'self' data:; connect-src 'self'")
+  if (isProduction) res.setHeader('Strict-Transport-Security', 'max-age=15552000; includeSubDomains')
   next()
 })
 
-app.get('/api/health', (_req, res) => res.json({ ok: true }))
+app.get('/api/health', (_req, res) => {
+  try {
+    fs.accessSync(runtimeDir, fs.constants.W_OK)
+    return res.json({ ok: true })
+  } catch {
+    return res.status(503).json({ ok: false, message: 'Storage is not writable.' })
+  }
+})
 
-app.post('/api/auth/register', (req, res) => {
+app.post('/api/auth/register', limitAuth, asyncHandler(async (req, res) => {
   const name = typeof req.body?.name === 'string' ? req.body.name.trim() : ''
   const email = typeof req.body?.email === 'string' ? req.body.email.trim().toLowerCase() : ''
   const password = typeof req.body?.password === 'string' ? req.body.password : ''
   if (name.length < 2 || name.length > 80) return sendValidationError(res, 'Enter a name between 2 and 80 characters.')
   if (!validateEmail(email)) return sendValidationError(res, 'Enter a valid email address.')
   if (password.length < 8 || password.length > 128) return sendValidationError(res, 'Use a password between 8 and 128 characters.')
-  const users = getUsers()
-  if (users.some((user) => user.email === email)) return res.status(409).json({ message: 'An account with that email already exists.' })
-  const credentials = hashPassword(password)
-  const user = { id: `user-${crypto.randomUUID()}`, name, email, role: 'Workspace member', initials: initials(name), color: colors[users.length % colors.length], ...credentials }
-  writeJson(runtimePath('users.json'), [...users, user])
-  setSessionCookie(res, createSession(user.id))
-  return res.status(201).json(publicUser(user))
-})
+  const created = await withStoreLock(async () => {
+    const users = getUsers()
+    if (users.some((user) => user.email === email)) return { conflict: true }
+    const credentials = await hashPassword(password)
+    const user = { id: `user-${crypto.randomUUID()}`, name, email, role: 'Workspace member', initials: initials(name), color: colors[users.length % colors.length], ...credentials }
+    writeJson(runtimePath('users.json'), [...users, user])
+    return { user, token: createSession(user.id) }
+  })
+  if (created.conflict) return res.status(409).json({ message: 'An account with that email already exists.' })
+  setSessionCookie(res, created.token)
+  return res.status(201).json(publicUser(created.user))
+}))
 
-app.post('/api/auth/login', (req, res) => {
+app.post('/api/auth/login', limitAuth, asyncHandler(async (req, res) => {
   const email = typeof req.body?.email === 'string' ? req.body.email.trim().toLowerCase() : ''
   const password = typeof req.body?.password === 'string' ? req.body.password : ''
-  const user = getUsers().find((item) => item.email === email)
-  if (!user || !verifyPassword(password, user)) return res.status(401).json({ message: 'Email or password is incorrect.' })
-  setSessionCookie(res, createSession(user.id))
-  return res.json(publicUser(user))
-})
+  const result = await withStoreLock(async () => {
+    const user = getUsers().find((item) => item.email === email)
+    const valid = await verifyPassword(password, user || dummyCredentials)
+    if (!user || !valid) return { invalid: true }
+    return { user, token: createSession(user.id) }
+  })
+  if (result.invalid) return res.status(401).json({ message: 'Email or password is incorrect.' })
+  setSessionCookie(res, result.token)
+  return res.json(publicUser(result.user))
+}))
 
 app.get('/api/auth/me', (req, res) => {
   const user = authenticatedUser(req)
   return res.json(user ? publicUser(user) : null)
 })
 
-app.patch('/api/auth/me', requireAuth, (req, res) => {
+app.patch('/api/auth/me', requireAuth, asyncHandler(async (req, res) => {
   const name = typeof req.body?.name === 'string' ? req.body.name.trim() : ''
   const color = typeof req.body?.color === 'string' ? req.body.color : req.user.color
   if (name.length < 2 || name.length > 80) return sendValidationError(res, 'Enter a name between 2 and 80 characters.')
   if (!colors.includes(color)) return sendValidationError(res, 'Choose a valid profile color.')
-  const users = getUsers()
-  const index = users.findIndex((user) => user.id === req.user.id)
-  if (index === -1) return res.status(404).json({ message: 'Account not found.' })
-  const updatedUser = { ...users[index], name, initials: initials(name), color }
-  users[index] = updatedUser
-  writeJson(runtimePath('users.json'), users)
+  const updatedUser = await withStoreLock(() => {
+    const users = getUsers()
+    const index = users.findIndex((user) => user.id === req.user.id)
+    if (index === -1) return null
+    const nextUser = { ...users[index], name, initials: initials(name), color }
+    users[index] = nextUser
+    writeJson(runtimePath('users.json'), users)
+    return nextUser
+  })
+  if (!updatedUser) return res.status(404).json({ message: 'Account not found.' })
   return res.json(publicUser(updatedUser))
-})
+}))
 
-app.post('/api/auth/logout', (req, res) => {
+app.post('/api/auth/logout', asyncHandler(async (req, res) => {
   const token = parseCookies(req.headers.cookie)[SESSION_COOKIE]
-  if (token) writeJson(runtimePath('sessions.json'), getSessions().filter((session) => session.token !== token))
+  if (token) {
+    await withStoreLock(() => {
+      writeJson(runtimePath('sessions.json'), getSessions().filter((session) => session.token !== token))
+    })
+  }
   clearSessionCookie(res)
   return res.json({ ok: true })
-})
+}))
 
 app.get('/api/app-data', requireAuth, (req, res) => {
   const employees = getEmployees()
@@ -250,43 +365,66 @@ app.get('/api/app-data', requireAuth, (req, res) => {
   return res.json({ rooms: getRooms(), employees, bookings: getBookings() })
 })
 
-app.post('/api/bookings', requireAuth, (req, res) => {
-  const booking = { ...req.body, title: typeof req.body?.title === 'string' ? req.body.title.trim() : '', notes: typeof req.body?.notes === 'string' ? req.body.notes.trim() : '', attendees: Number(req.body?.attendees) }
-  const error = validateBooking(booking, getBookings())
-  if (error) return sendValidationError(res, error)
-  const created = { ...booking, id: `booking-${crypto.randomUUID()}` }
-  writeJson(runtimePath('bookings.json'), [...getBookings(), created])
-  return res.status(201).json(created)
-})
+app.post('/api/bookings', requireAuth, asyncHandler(async (req, res) => {
+  const created = await withStoreLock(() => {
+    const bookings = getBookings()
+    const booking = normalizeBooking(req.body, `booking-${crypto.randomUUID()}`, bookingStatus(req.body?.status, 'confirmed'))
+    const error = validateBooking(booking, bookings)
+    if (error) return { error }
+    writeJson(runtimePath('bookings.json'), [...bookings, booking])
+    return { booking }
+  })
+  if (created.error) return sendValidationError(res, created.error)
+  return res.status(201).json(created.booking)
+}))
 
-app.put('/api/bookings/:id', requireAuth, (req, res) => {
-  const bookings = getBookings()
-  const index = bookings.findIndex((booking) => booking.id === req.params.id)
-  if (index === -1) return res.status(404).json({ message: 'Booking not found.' })
-  const booking = { ...req.body, id: req.params.id, title: typeof req.body?.title === 'string' ? req.body.title.trim() : '', notes: typeof req.body?.notes === 'string' ? req.body.notes.trim() : '', attendees: Number(req.body?.attendees) }
-  const error = validateBooking(booking, bookings, req.params.id)
-  if (error) return sendValidationError(res, error)
-  bookings[index] = booking
-  writeJson(runtimePath('bookings.json'), bookings)
-  return res.json(booking)
-})
+app.put('/api/bookings/:id', requireAuth, asyncHandler(async (req, res) => {
+  const updated = await withStoreLock(() => {
+    const bookings = getBookings()
+    const index = bookings.findIndex((booking) => booking.id === req.params.id)
+    if (index === -1) return { missing: true }
+    const booking = normalizeBooking(req.body, req.params.id, bookingStatus(req.body?.status, bookings[index].status === 'cancelled' ? 'confirmed' : bookings[index].status))
+    const error = validateBooking(booking, bookings, req.params.id)
+    if (error) return { error }
+    bookings[index] = booking
+    writeJson(runtimePath('bookings.json'), bookings)
+    return { booking }
+  })
+  if (updated.missing) return res.status(404).json({ message: 'Booking not found.' })
+  if (updated.error) return sendValidationError(res, updated.error)
+  return res.json(updated.booking)
+}))
 
-app.delete('/api/bookings/:id', requireAuth, (req, res) => {
-  const bookings = getBookings()
-  const index = bookings.findIndex((booking) => booking.id === req.params.id)
-  if (index === -1) return res.status(404).json({ message: 'Booking not found.' })
-  bookings[index] = { ...bookings[index], status: 'cancelled' }
-  writeJson(runtimePath('bookings.json'), bookings)
-  return res.json(bookings[index])
-})
+app.delete('/api/bookings/:id', requireAuth, asyncHandler(async (req, res) => {
+  const cancelled = await withStoreLock(() => {
+    const bookings = getBookings()
+    const index = bookings.findIndex((booking) => booking.id === req.params.id)
+    if (index === -1) return { missing: true }
+    bookings[index] = { ...bookings[index], status: 'cancelled' }
+    writeJson(runtimePath('bookings.json'), bookings)
+    return { booking: bookings[index] }
+  })
+  if (cancelled.missing) return res.status(404).json({ message: 'Booking not found.' })
+  return res.json(cancelled.booking)
+}))
+
+app.use('/api', (_req, res) => res.status(404).json({ message: 'Not found.' }))
 
 if (serveFrontend) {
   const distDir = path.join(rootDir, 'dist')
-  app.use(express.static(distDir))
-  app.use((req, res, next) => {
-    if (req.method === 'GET' && !req.path.startsWith('/api/')) return res.sendFile(path.join(distDir, 'index.html'))
-    return next()
-  })
+  const indexFile = path.join(distDir, 'index.html')
+  if (!fs.existsSync(indexFile)) {
+    console.error('Frontend build missing. Run `npm run build` before `npm start`.')
+    process.exit(1)
+  }
+  app.use(express.static(distDir, {
+    index: false,
+    setHeaders(response, filePath) {
+      if (filePath.endsWith('.html')) response.setHeader('Cache-Control', 'no-cache')
+      else if (/\.[a-f0-9]{8,}\./i.test(path.basename(filePath))) response.setHeader('Cache-Control', 'public, max-age=31536000, immutable')
+    },
+  }))
+  app.get(/^(?!\/api\/).*/, (_req, res) => res.sendFile(indexFile))
 }
 
 app.use((error, _req, res, _next) => {
@@ -295,4 +433,13 @@ app.use((error, _req, res, _next) => {
   return res.status(500).json({ message: 'The server could not complete that request.' })
 })
 
-app.listen(port, () => console.log(`Loop API listening on http://localhost:${port}`))
+const server = app.listen(port, host, () => console.log(`Loop API listening on http://${host}:${port}`))
+
+function shutdown(signal) {
+  console.log(`Received ${signal}, shutting down`)
+  server.close(() => process.exit(0))
+  setTimeout(() => process.exit(1), 10_000).unref()
+}
+
+process.on('SIGTERM', () => shutdown('SIGTERM'))
+process.on('SIGINT', () => shutdown('SIGINT'))
