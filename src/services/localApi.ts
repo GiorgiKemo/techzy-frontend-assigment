@@ -268,6 +268,7 @@ export async function verifyEmail(token: string) {
   }
   if (!verifiedUser) throw new AuthError('Verification link is invalid or expired.', 400)
   save('users', users)
+  save('session', { token: crypto.randomUUID(), userId: verifiedUser.id, expiresAt: Date.now() + SESSION_TTL_MS })
   return publicUser(verifiedUser)
 }
 
