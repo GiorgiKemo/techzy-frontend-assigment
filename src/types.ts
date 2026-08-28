@@ -27,6 +27,7 @@ export interface AuthUser {
   role: string
   initials: string
   color: string
+  emailVerified?: boolean
 }
 
 export interface Booking {

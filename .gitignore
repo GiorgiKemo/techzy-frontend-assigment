@@ -5,3 +5,6 @@ output/
 .playwright-cli/
 server/data/*.json
 server/data/*.tmp
+.env
+.env.local
+.env.*.local

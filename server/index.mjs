@@ -4,6 +4,12 @@ import path from 'node:path'
 import { promisify } from 'node:util'
 import { fileURLToPath } from 'node:url'
 import express from 'express'
+import { loadEnvFile } from './lib/env.mjs'
+import { generateToken, hashToken, verifyTokenHash } from './lib/tokens.mjs'
+import { isEmailConfigured, sendBookingEmail, sendPasswordResetEmail, sendVerificationEmail } from './email.mjs'
+import { handleSendBooking, handleSendPasswordReset, handleSendVerification } from './routes/emailProxy.mjs'
+
+loadEnvFile()
 
 const scrypt = promisify(crypto.scrypt)
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
@@ -20,6 +26,10 @@ const SESSION_COOKIE = 'loop_session'
 const SESSION_TTL_MS = 7 * 24 * 60 * 60 * 1000
 const AUTH_WINDOW_MS = 15 * 60 * 1000
 const AUTH_ATTEMPT_LIMIT = 10
+const EMAIL_WINDOW_MS = 15 * 60 * 1000
+const EMAIL_ATTEMPT_LIMIT = 8
+const VERIFICATION_TTL_MS = 24 * 60 * 60 * 1000
+const RESET_TTL_MS = 60 * 60 * 1000
 const colors = ['#f1d2b9', '#c9e5e2', '#d9c9f0', '#d9e4b7', '#f0cdd3', '#cbd9ef']
 const dummyCredentials = {
   salt: crypto.randomBytes(16).toString('base64'),
@@ -111,7 +121,57 @@ function initials(name) {
 }
 
 function publicUser(user) {
-  return { id: user.id, name: user.name, email: user.email, role: user.role, initials: user.initials, color: user.color }
+  return {
+    id: user.id,
+    name: user.name,
+    email: user.email,
+    role: user.role,
+    initials: user.initials,
+    color: user.color,
+    emailVerified: isEmailVerified(user),
+  }
+}
+
+function isEmailVerified(user) {
+  return user?.emailVerified !== false
+}
+
+function issueVerificationToken() {
+  const token = generateToken()
+  return {
+    token,
+    verificationToken: hashToken(token),
+    verificationTokenExpires: Date.now() + VERIFICATION_TTL_MS,
+  }
+}
+
+function issueResetToken() {
+  const token = generateToken()
+  return {
+    token,
+    resetToken: hashToken(token),
+    resetTokenExpires: Date.now() + RESET_TTL_MS,
+  }
+}
+
+async function notifyOrganizerBooking(user, booking, event) {
+  if (!user?.email || !isEmailVerified(user)) return
+  const room = getRooms().find((item) => item.id === booking.roomId)
+  try {
+    await sendBookingEmail({
+      email: user.email,
+      name: user.name,
+      event,
+      booking,
+      roomName: room?.name || 'Room',
+    })
+  } catch (error) {
+    console.error('Booking email failed:', error)
+  }
+}
+
+function organizerUser(organizerId) {
+  return getUsers().find((user) => user.id === organizerId) || null
 }
 
 function parseCookies(header = '') {
@@ -161,6 +221,13 @@ function requireAuth(req, res, next) {
   const user = authenticatedUser(req)
   if (!user) return res.status(401).json({ message: 'Please sign in to continue.' })
   req.user = user
+  return next()
+}
+
+function requireVerified(req, res, next) {
+  if (!isEmailVerified(req.user)) {
+    return res.status(403).json({ message: 'Please verify your email address to continue.', code: 'EMAIL_NOT_VERIFIED' })
+  }
   return next()
 }
 
@@ -262,6 +329,14 @@ function limitAuth(req, res, next) {
   return next()
 }
 
+function limitEmail(req, res, next) {
+  if (!rateLimit(`email:${clientKey(req)}`, EMAIL_ATTEMPT_LIMIT, EMAIL_WINDOW_MS)) {
+    res.setHeader('Retry-After', '900')
+    return res.status(429).json({ message: 'Too many email requests. Try again in a few minutes.' })
+  }
+  return next()
+}
+
 function asyncHandler(fn) {
   return (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next)
 }
@@ -298,15 +373,35 @@ app.post('/api/auth/register', limitAuth, asyncHandler(async (req, res) => {
   if (name.length < 2 || name.length > 80) return sendValidationError(res, 'Enter a name between 2 and 80 characters.')
   if (!validateEmail(email)) return sendValidationError(res, 'Enter a valid email address.')
   if (password.length < 8 || password.length > 128) return sendValidationError(res, 'Use a password between 8 and 128 characters.')
+  const verification = issueVerificationToken()
   const created = await withStoreLock(async () => {
     const users = getUsers()
     if (users.some((user) => user.email === email)) return { conflict: true }
     const credentials = await hashPassword(password)
-    const user = { id: `user-${crypto.randomUUID()}`, name, email, role: 'Workspace member', initials: initials(name), color: colors[users.length % colors.length], ...credentials }
+    const user = {
+      id: `user-${crypto.randomUUID()}`,
+      name,
+      email,
+      role: 'Workspace member',
+      initials: initials(name),
+      color: colors[users.length % colors.length],
+      emailVerified: false,
+      verificationToken: verification.verificationToken,
+      verificationTokenExpires: verification.verificationTokenExpires,
+      ...credentials,
+    }
     writeJson(runtimePath('users.json'), [...users, user])
     return { user, token: createSession(user.id) }
   })
   if (created.conflict) return res.status(409).json({ message: 'An account with that email already exists.' })
+  try {
+    await sendVerificationEmail({ email, name, token: verification.token })
+  } catch (error) {
+    console.error('Verification email failed:', error)
+    if (!isEmailConfigured()) {
+      console.info(`[dev] Verification link: ${process.env.APP_BASE_URL || 'http://localhost:5173'}?verify=${verification.token}`)
+    }
+  }
   setSessionCookie(res, created.token)
   return res.status(201).json(publicUser(created.user))
 }))
@@ -359,13 +454,122 @@ app.post('/api/auth/logout', asyncHandler(async (req, res) => {
   return res.json({ ok: true })
 }))
 
-app.get('/api/app-data', requireAuth, (req, res) => {
+app.post('/api/auth/verify-email', limitAuth, asyncHandler(async (req, res) => {
+  const token = typeof req.body?.token === 'string' ? req.body.token.trim() : ''
+  if (token.length < 32) return sendValidationError(res, 'Verification link is invalid or expired.')
+  const verified = await withStoreLock(() => {
+    const users = getUsers()
+    const index = users.findIndex((user) => user.verificationToken && user.verificationTokenExpires > Date.now() && verifyTokenHash(token, user.verificationToken))
+    if (index === -1) return { invalid: true }
+    const nextUser = {
+      ...users[index],
+      emailVerified: true,
+      verificationToken: undefined,
+      verificationTokenExpires: undefined,
+    }
+    users[index] = nextUser
+    writeJson(runtimePath('users.json'), users)
+    return { user: nextUser }
+  })
+  if (verified.invalid) return res.status(400).json({ message: 'Verification link is invalid or expired.' })
+  return res.json(publicUser(verified.user))
+}))
+
+app.post('/api/auth/resend-verification', limitEmail, requireAuth, asyncHandler(async (req, res) => {
+  if (isEmailVerified(req.user)) return res.json({ ok: true, message: 'Email is already verified.' })
+  const verification = issueVerificationToken()
+  const updated = await withStoreLock(() => {
+    const users = getUsers()
+    const index = users.findIndex((user) => user.id === req.user.id)
+    if (index === -1) return null
+    const nextUser = {
+      ...users[index],
+      verificationToken: verification.verificationToken,
+      verificationTokenExpires: verification.verificationTokenExpires,
+    }
+    users[index] = nextUser
+    writeJson(runtimePath('users.json'), users)
+    return nextUser
+  })
+  if (!updated) return res.status(404).json({ message: 'Account not found.' })
+  try {
+    await sendVerificationEmail({ email: updated.email, name: updated.name, token: verification.token })
+    return res.json({ ok: true, sent: isEmailConfigured() })
+  } catch (error) {
+    console.error('Resend verification failed:', error)
+    if (!isEmailConfigured()) {
+      console.info(`[dev] Verification link: ${process.env.APP_BASE_URL || 'http://localhost:5173'}?verify=${verification.token}`)
+      return res.json({ ok: true, sent: false })
+    }
+    return res.status(500).json({ message: 'We could not send the verification email.' })
+  }
+}))
+
+app.post('/api/auth/forgot-password', limitEmail, asyncHandler(async (req, res) => {
+  const email = typeof req.body?.email === 'string' ? req.body.email.trim().toLowerCase() : ''
+  if (!validateEmail(email)) return sendValidationError(res, 'Enter a valid email address.')
+  const reset = issueResetToken()
+  const user = await withStoreLock(() => {
+    const users = getUsers()
+    const index = users.findIndex((item) => item.email === email)
+    if (index === -1) return null
+    const nextUser = {
+      ...users[index],
+      resetToken: reset.resetToken,
+      resetTokenExpires: reset.resetTokenExpires,
+    }
+    users[index] = nextUser
+    writeJson(runtimePath('users.json'), users)
+    return nextUser
+  })
+  if (user) {
+    try {
+      await sendPasswordResetEmail({ email: user.email, name: user.name, token: reset.token })
+    } catch (error) {
+      console.error('Password reset email failed:', error)
+      if (!isEmailConfigured()) {
+        console.info(`[dev] Password reset link: ${process.env.APP_BASE_URL || 'http://localhost:5173'}?reset=${reset.token}`)
+      }
+    }
+  }
+  return res.json({ ok: true, message: 'If an account exists for that email, we sent password reset instructions.' })
+}))
+
+app.post('/api/auth/reset-password', limitAuth, asyncHandler(async (req, res) => {
+  const token = typeof req.body?.token === 'string' ? req.body.token.trim() : ''
+  const password = typeof req.body?.password === 'string' ? req.body.password : ''
+  if (token.length < 32) return sendValidationError(res, 'Reset link is invalid or expired.')
+  if (password.length < 8 || password.length > 128) return sendValidationError(res, 'Use a password between 8 and 128 characters.')
+  const updated = await withStoreLock(async () => {
+    const users = getUsers()
+    const index = users.findIndex((user) => user.resetToken && user.resetTokenExpires > Date.now() && verifyTokenHash(token, user.resetToken))
+    if (index === -1) return { invalid: true }
+    const credentials = await hashPassword(password)
+    const nextUser = {
+      ...users[index],
+      ...credentials,
+      resetToken: undefined,
+      resetTokenExpires: undefined,
+    }
+    users[index] = nextUser
+    writeJson(runtimePath('users.json'), users)
+    return { user: nextUser }
+  })
+  if (updated.invalid) return res.status(400).json({ message: 'Reset link is invalid or expired.' })
+  return res.json({ ok: true, message: 'Your password has been updated. You can sign in now.' })
+}))
+
+app.post('/api/email/send-verification', limitEmail, asyncHandler(handleSendVerification))
+app.post('/api/email/send-password-reset', limitEmail, asyncHandler(handleSendPasswordReset))
+app.post('/api/email/send-booking', limitEmail, asyncHandler(handleSendBooking))
+
+app.get('/api/app-data', requireAuth, requireVerified, (req, res) => {
   const employees = getEmployees()
   if (!employees.some((employee) => employee.id === req.user.id)) employees.push(userForEmployees(req.user))
   return res.json({ rooms: getRooms(), employees, bookings: getBookings() })
 })
 
-app.post('/api/bookings', requireAuth, asyncHandler(async (req, res) => {
+app.post('/api/bookings', requireAuth, requireVerified, asyncHandler(async (req, res) => {
   const created = await withStoreLock(() => {
     const bookings = getBookings()
     const booking = normalizeBooking(req.body, `booking-${crypto.randomUUID()}`, bookingStatus(req.body?.status, 'confirmed'))
@@ -375,10 +579,12 @@ app.post('/api/bookings', requireAuth, asyncHandler(async (req, res) => {
     return { booking }
   })
   if (created.error) return sendValidationError(res, created.error)
+  const organizer = organizerUser(created.booking.organizerId) || req.user
+  await notifyOrganizerBooking(organizer, created.booking, 'created')
   return res.status(201).json(created.booking)
 }))
 
-app.put('/api/bookings/:id', requireAuth, asyncHandler(async (req, res) => {
+app.put('/api/bookings/:id', requireAuth, requireVerified, asyncHandler(async (req, res) => {
   const updated = await withStoreLock(() => {
     const bookings = getBookings()
     const index = bookings.findIndex((booking) => booking.id === req.params.id)
@@ -392,10 +598,12 @@ app.put('/api/bookings/:id', requireAuth, asyncHandler(async (req, res) => {
   })
   if (updated.missing) return res.status(404).json({ message: 'Booking not found.' })
   if (updated.error) return sendValidationError(res, updated.error)
+  const organizer = organizerUser(updated.booking.organizerId) || req.user
+  await notifyOrganizerBooking(organizer, updated.booking, 'updated')
   return res.json(updated.booking)
 }))
 
-app.delete('/api/bookings/:id', requireAuth, asyncHandler(async (req, res) => {
+app.delete('/api/bookings/:id', requireAuth, requireVerified, asyncHandler(async (req, res) => {
   const cancelled = await withStoreLock(() => {
     const bookings = getBookings()
     const index = bookings.findIndex((booking) => booking.id === req.params.id)
@@ -405,6 +613,8 @@ app.delete('/api/bookings/:id', requireAuth, asyncHandler(async (req, res) => {
     return { booking: bookings[index] }
   })
   if (cancelled.missing) return res.status(404).json({ message: 'Booking not found.' })
+  const organizer = organizerUser(cancelled.booking.organizerId) || req.user
+  await notifyOrganizerBooking(organizer, cancelled.booking, 'cancelled')
   return res.json(cancelled.booking)
 }))
 

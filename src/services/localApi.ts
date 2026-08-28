@@ -4,14 +4,21 @@ import bookingsSeed from '../data/bookings.json'
 import { addDays, daysBetween, getTodayDate, SEED_BASE_DATE, timeToMinutes } from '../lib/date'
 import type { AppData, AuthUser, Booking, BookingStatus, Employee, Room } from '../types'
 import { ApiError, AuthError } from './errors'
+import { sendBookingEmailProxy, sendPasswordResetEmailProxy, sendVerificationEmailProxy } from './emailProxy'
 
 const STORAGE_PREFIX = 'loop.v1.'
 const SESSION_TTL_MS = 7 * 24 * 60 * 60 * 1000
+const VERIFICATION_TTL_MS = 24 * 60 * 60 * 1000
+const RESET_TTL_MS = 60 * 60 * 1000
 const colors = ['#f1d2b9', '#c9e5e2', '#d9c9f0', '#d9e4b7', '#f0cdd3', '#cbd9ef']
 
 interface StoredUser extends AuthUser {
   salt: string
   hash: string
+  verificationToken?: string
+  verificationTokenExpires?: number
+  resetToken?: string
+  resetTokenExpires?: number
 }
 
 interface StoredSession {
@@ -38,7 +45,60 @@ function initials(name: string) {
 }
 
 function publicUser(user: StoredUser): AuthUser {
-  return { id: user.id, name: user.name, email: user.email, role: user.role, initials: user.initials, color: user.color }
+  return {
+    id: user.id,
+    name: user.name,
+    email: user.email,
+    role: user.role,
+    initials: user.initials,
+    color: user.color,
+    emailVerified: user.emailVerified !== false,
+  }
+}
+
+function generateToken() {
+  const bytes = new Uint8Array(32)
+  crypto.getRandomValues(bytes)
+  return Array.from(bytes, (byte) => byte.toString(16).padStart(2, '0')).join('')
+}
+
+async function hashToken(token: string) {
+  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(token))
+  return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, '0')).join('')
+}
+
+async function timingSafeEqualHex(left: string, right: string) {
+  if (left.length !== right.length) return false
+  let mismatch = 0
+  for (let index = 0; index < left.length; index += 1) {
+    mismatch |= left.charCodeAt(index) ^ right.charCodeAt(index)
+  }
+  return mismatch === 0
+}
+
+function issueVerificationToken() {
+  const token = generateToken()
+  return {
+    token,
+    apply: async (user: StoredUser) => ({
+      ...user,
+      emailVerified: false,
+      verificationToken: await hashToken(token),
+      verificationTokenExpires: Date.now() + VERIFICATION_TTL_MS,
+    }),
+  }
+}
+
+function issueResetToken() {
+  const token = generateToken()
+  return {
+    token,
+    apply: async (user: StoredUser) => ({
+      ...user,
+      resetToken: await hashToken(token),
+      resetTokenExpires: Date.now() + RESET_TTL_MS,
+    }),
+  }
 }
 
 async function hashPassword(password: string, salt: string) {
@@ -71,6 +131,19 @@ function requireUser(): StoredUser {
   const user = session ? load<StoredUser[]>('users', []).find((item) => item.id === session.userId) : undefined
   if (!user) throw new AuthError('Please sign in to continue.', 401)
   return user
+}
+
+function requireVerifiedUser(): StoredUser {
+  const user = requireUser()
+  if (user.emailVerified === false) throw new AuthError('Please verify your email address to continue.', 403)
+  return user
+}
+
+async function notifyBooking(user: StoredUser, booking: Booking, event: 'created' | 'updated' | 'cancelled') {
+  if (user.emailVerified === false) return
+  const rooms = load<Room[]>('rooms', [])
+  const room = rooms.find((item) => item.id === booking.roomId)
+  await sendBookingEmailProxy(user.email, user.name, event, booking, room?.name || 'Room')
 }
 
 function validateBooking(booking: Booking, bookings: Booking[], editingId: string | null) {
@@ -135,6 +208,7 @@ export async function register(name: string, email: string, password: string) {
   const users = load<StoredUser[]>('users', [])
   if (users.some((user) => user.email === cleanedEmail)) throw new AuthError('An account with that email already exists.', 409)
   const salt = crypto.randomUUID()
+  const verification = issueVerificationToken()
   const user: StoredUser = {
     id: `user-${crypto.randomUUID()}`,
     name: cleanedName,
@@ -142,11 +216,15 @@ export async function register(name: string, email: string, password: string) {
     role: 'Workspace member',
     initials: initials(cleanedName),
     color: colors[users.length % colors.length],
+    emailVerified: false,
+    verificationToken: await hashToken(verification.token),
+    verificationTokenExpires: Date.now() + VERIFICATION_TTL_MS,
     salt,
     hash: await hashPassword(password, salt),
   }
   save('users', [...users, user])
   save('session', { token: crypto.randomUUID(), userId: user.id, expiresAt: Date.now() + SESSION_TTL_MS })
+  await sendVerificationEmailProxy(cleanedEmail, cleanedName, verification.token)
   return publicUser(user)
 }
 
@@ -169,9 +247,97 @@ export async function logout() {
   localStorage.removeItem(STORAGE_PREFIX + 'session')
 }
 
+export async function verifyEmail(token: string) {
+  ensureInitialized()
+  const cleaned = token.trim()
+  if (cleaned.length < 32) throw new AuthError('Verification link is invalid or expired.', 400)
+  const users = load<StoredUser[]>('users', [])
+  let verifiedUser: StoredUser | null = null
+  for (let index = 0; index < users.length; index += 1) {
+    const user = users[index]
+    if (!user.verificationToken || !user.verificationTokenExpires || user.verificationTokenExpires <= Date.now()) continue
+    if (!(await timingSafeEqualHex(await hashToken(cleaned), user.verificationToken))) continue
+    verifiedUser = {
+      ...user,
+      emailVerified: true,
+      verificationToken: undefined,
+      verificationTokenExpires: undefined,
+    }
+    users[index] = verifiedUser
+    break
+  }
+  if (!verifiedUser) throw new AuthError('Verification link is invalid or expired.', 400)
+  save('users', users)
+  return publicUser(verifiedUser)
+}
+
+export async function resendVerification() {
+  ensureInitialized()
+  const current = requireUser()
+  if (current.emailVerified !== false) return { ok: true, sent: false, message: 'Email is already verified.' }
+  const verification = issueVerificationToken()
+  const users = load<StoredUser[]>('users', [])
+  const index = users.findIndex((user) => user.id === current.id)
+  if (index === -1) throw new AuthError('Account not found.', 404)
+  users[index] = {
+    ...users[index],
+    verificationToken: await hashToken(verification.token),
+    verificationTokenExpires: Date.now() + VERIFICATION_TTL_MS,
+  }
+  save('users', users)
+  const result = await sendVerificationEmailProxy(users[index].email, users[index].name, verification.token)
+  return { ok: true, sent: result.sent }
+}
+
+export async function forgotPassword(email: string) {
+  ensureInitialized()
+  const cleanedEmail = email.trim().toLowerCase()
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(cleanedEmail)) throw new AuthError('Enter a valid email address.', 400)
+  const users = load<StoredUser[]>('users', [])
+  const index = users.findIndex((user) => user.email === cleanedEmail)
+  if (index !== -1) {
+    const reset = issueResetToken()
+    users[index] = {
+      ...users[index],
+      resetToken: await hashToken(reset.token),
+      resetTokenExpires: Date.now() + RESET_TTL_MS,
+    }
+    save('users', users)
+    await sendPasswordResetEmailProxy(users[index].email, users[index].name, reset.token)
+  }
+  return { ok: true, message: 'If an account exists for that email, we sent password reset instructions.' }
+}
+
+export async function resetPassword(token: string, password: string) {
+  ensureInitialized()
+  const cleaned = token.trim()
+  if (cleaned.length < 32) throw new AuthError('Reset link is invalid or expired.', 400)
+  if (password.length < 8 || password.length > 128) throw new AuthError('Use a password between 8 and 128 characters.', 400)
+  const users = load<StoredUser[]>('users', [])
+  let updated = false
+  for (let index = 0; index < users.length; index += 1) {
+    const user = users[index]
+    if (!user.resetToken || !user.resetTokenExpires || user.resetTokenExpires <= Date.now()) continue
+    if (!(await timingSafeEqualHex(await hashToken(cleaned), user.resetToken))) continue
+    const salt = crypto.randomUUID()
+    users[index] = {
+      ...user,
+      salt,
+      hash: await hashPassword(password, salt),
+      resetToken: undefined,
+      resetTokenExpires: undefined,
+    }
+    updated = true
+    break
+  }
+  if (!updated) throw new AuthError('Reset link is invalid or expired.', 400)
+  save('users', users)
+  return { ok: true, message: 'Your password has been updated. You can sign in now.' }
+}
+
 export async function getAppData(): Promise<AppData> {
   ensureInitialized()
-  const user = requireUser()
+  const user = requireVerifiedUser()
   const employees = load<Employee[]>('employees', [])
   if (!employees.some((employee) => employee.id === user.id)) {
     employees.push({ id: user.id, name: user.name, role: user.role, initials: user.initials, color: user.color })
@@ -181,18 +347,19 @@ export async function getAppData(): Promise<AppData> {
 
 export async function createBooking(input: Omit<Booking, 'id'>) {
   ensureInitialized()
-  requireUser()
+  const user = requireVerifiedUser()
   const bookings = load<Booking[]>('bookings', [])
   const status: BookingStatus = input.status === 'tentative' ? 'tentative' : 'confirmed'
   const booking = normalizeBooking(input, `booking-${crypto.randomUUID()}`, status)
   validateBooking(booking, bookings, null)
   save('bookings', [...bookings, booking])
+  if (booking.organizerId === user.id) await notifyBooking(user, booking, 'created')
   return booking
 }
 
 export async function updateBooking(id: string, input: Omit<Booking, 'id'>) {
   ensureInitialized()
-  requireUser()
+  const user = requireVerifiedUser()
   const bookings = load<Booking[]>('bookings', [])
   const index = bookings.findIndex((booking) => booking.id === id)
   if (index === -1) throw new ApiError('Booking not found.', 404)
@@ -201,16 +368,18 @@ export async function updateBooking(id: string, input: Omit<Booking, 'id'>) {
   validateBooking(booking, bookings, id)
   bookings[index] = booking
   save('bookings', bookings)
+  if (booking.organizerId === user.id) await notifyBooking(user, booking, 'updated')
   return booking
 }
 
 export async function cancelBooking(id: string) {
   ensureInitialized()
-  requireUser()
+  const user = requireVerifiedUser()
   const bookings = load<Booking[]>('bookings', [])
   const index = bookings.findIndex((booking) => booking.id === id)
   if (index === -1) throw new ApiError('Booking not found.', 404)
   bookings[index] = { ...bookings[index], status: 'cancelled' }
   save('bookings', bookings)
+  if (bookings[index].organizerId === user.id) await notifyBooking(user, bookings[index], 'cancelled')
   return bookings[index]
 }

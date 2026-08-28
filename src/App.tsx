@@ -8,7 +8,7 @@ import {
 } from './lib/icons'
 import { addDays, formatDate, formatTime, getReferenceMinutes, getTodayDate, getWeekDates, greetingForNow, isPast, isUpcoming, parseDate, timeToMinutes } from './lib/date'
 import { ApiError, cancelBooking as cancelBookingRequest, createBooking, getAppData, updateBooking } from './services/data'
-import { getCurrentUser, login, logout, register, updateProfile } from './services/auth'
+import { getCurrentUser, isUserVerified, login, logout, register, resendVerification, updateProfile, verifyEmail, forgotPassword, resetPassword } from './services/auth'
 import { useLocalApi } from './services/mode'
 import type { AppData, AuthUser, Booking, BookingStatus, Employee, Room, ViewName } from './types'
 
@@ -50,6 +50,33 @@ function App() {
   const [sidebarOpen, setSidebarOpen] = useState(false)
   const [workspaceOpen, setWorkspaceOpen] = useState(false)
   const [isProfileModalOpen, setProfileModalOpen] = useState(false)
+  const [authNotice, setAuthNotice] = useState<string | null>(null)
+
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search)
+    const verifyToken = params.get('verify')
+    const resetToken = params.get('reset')
+    if (!verifyToken && !resetToken) return
+    params.delete('verify')
+    params.delete('reset')
+    const nextSearch = params.toString()
+    window.history.replaceState({}, '', `${window.location.pathname}${nextSearch ? `?${nextSearch}` : ''}`)
+    if (verifyToken) {
+      verifyEmail(verifyToken)
+        .then((verifiedUser) => {
+          setUser(verifiedUser)
+          setAuthNotice('Your email is verified. Welcome to Loop.')
+        })
+        .catch((error) => setAuthNotice(error instanceof Error ? error.message : 'Verification failed.'))
+      return
+    }
+    if (resetToken) {
+      logout().catch(() => undefined).finally(() => {
+        setUser(null)
+        setAuthNotice(`reset:${resetToken}`)
+      })
+    }
+  }, [])
 
   useEffect(() => {
     getCurrentUser().then(setUser).catch(() => setUser(null)).finally(() => setAuthLoading(false))
@@ -60,10 +87,18 @@ function App() {
       setData(null)
       return
     }
+    if (!isUserVerified(user)) {
+      setData(null)
+      return
+    }
     setAppError(null)
     getAppData().then(setData).catch((error) => {
       if (error instanceof ApiError && error.status === 401) {
         setUser(null)
+        return
+      }
+      if (error instanceof ApiError && error.status === 403) {
+        setData(null)
         return
       }
       setAppError(error instanceof Error ? error.message : 'We could not load your workspace.')
@@ -131,7 +166,13 @@ function App() {
   }, [])
 
   if (authLoading) return <div className="loading-screen" role="status" aria-live="polite"><div className="loading-mark">L</div><span>Checking your session…</span></div>
-  if (!user) return <AuthScreen onAuthenticated={setUser} />
+  if (!user) {
+    const resetToken = authNotice?.startsWith('reset:') ? authNotice.slice(6) : undefined
+    return <AuthScreen onAuthenticated={setUser} initialNotice={resetToken ? undefined : authNotice} resetToken={resetToken} onClearNotice={() => setAuthNotice(null)} />
+  }
+  if (!isUserVerified(user)) {
+    return <VerifyEmailScreen user={user} onLogout={async () => { await logout().catch(() => undefined); setUser(null); setData(null) }} initialNotice={authNotice} onClearNotice={() => setAuthNotice(null)} />
+  }
   if (appError) return <ErrorState message={appError} onRetry={() => { setAppError(null); getAppData().then(setData).catch((error) => { if (error instanceof ApiError && error.status === 401) { setUser(null); return } setAppError(error instanceof Error ? error.message : 'We could not load your workspace.') }) }} onLogout={() => logout().finally(() => { setUser(null); setData(null) })} />
   if (!data) return <div className="loading-screen" role="status" aria-live="polite"><div className="loading-mark">L</div><span>Loading your workspace…</span></div>
 
@@ -444,15 +485,22 @@ function BookingModal({ data, currentUserId, initialBooking, roomId, selectedDat
 
 function CancelModal({ booking, onClose, onConfirm }: { booking: Booking; onClose: () => void; onConfirm: () => Promise<void> }) { const [busy, setBusy] = useState(false); const confirm = async () => { if (busy) return; setBusy(true); await onConfirm(); setBusy(false) }; return <div className="modal-backdrop" onMouseDown={(event) => event.target === event.currentTarget && !busy && onClose()}><div className="confirm-modal" role="alertdialog" aria-modal="true" aria-labelledby="cancel-modal-title"><div className="confirm-icon"><TrashIcon size={20} /></div><h2 id="cancel-modal-title">Cancel this booking?</h2><p><strong>{booking.title}</strong> will be removed from the room schedule. This action can’t be undone.</p><div className="confirm-actions"><button type="button" className="button button-secondary" onClick={onClose} disabled={busy}>Keep booking</button><button type="button" className="button button-danger" onClick={confirm} disabled={busy}>{busy ? 'Cancelling…' : 'Cancel booking'}</button></div></div></div> }
 
-function AuthScreen({ onAuthenticated }: { onAuthenticated: (user: AuthUser) => void }) {
-  const [mode, setMode] = useState<'login' | 'register'>('login')
+function AuthScreen({ onAuthenticated, initialNotice, resetToken, onClearNotice }: { onAuthenticated: (user: AuthUser) => void; initialNotice?: string | null; resetToken?: string; onClearNotice?: () => void }) {
+  const [mode, setMode] = useState<'login' | 'register' | 'forgot' | 'reset'>(resetToken ? 'reset' : 'login')
   const [name, setName] = useState('')
   const [email, setEmail] = useState('')
   const [password, setPassword] = useState('')
   const [confirmPassword, setConfirmPassword] = useState('')
   const [error, setError] = useState('')
+  const [notice, setNotice] = useState(initialNotice || '')
   const [busy, setBusy] = useState(false)
   const isRegistering = mode === 'register'
+  const isForgot = mode === 'forgot'
+  const isReset = mode === 'reset'
+
+  useEffect(() => {
+    if (initialNotice) setNotice(initialNotice)
+  }, [initialNotice])
 
   const submit = async (event: FormEvent) => {
     event.preventDefault()
@@ -460,17 +508,69 @@ function AuthScreen({ onAuthenticated }: { onAuthenticated: (user: AuthUser) => 
     if (isRegistering && password !== confirmPassword) { setError('Passwords do not match.'); return }
     setBusy(true)
     setError('')
+    setNotice('')
+    onClearNotice?.()
     try {
-      const user = isRegistering ? await register(name, email, password) : await login(email, password)
-      onAuthenticated(user)
+      if (isForgot) {
+        const result = await forgotPassword(email)
+        setNotice(result.message)
+        return
+      }
+      if (isReset && resetToken) {
+        const result = await resetPassword(resetToken, password)
+        setNotice(result.message)
+        setMode('login')
+        setPassword('')
+        setConfirmPassword('')
+        return
+      }
+      const nextUser = isRegistering ? await register(name, email, password) : await login(email, password)
+      onAuthenticated(nextUser)
     } catch (authError) {
-      setError(authError instanceof Error ? authError.message : 'We could not sign you in.')
+      setError(authError instanceof Error ? authError.message : 'We could not complete that request.')
     } finally {
       setBusy(false)
     }
   }
 
-  return <main className="auth-shell"><section className="auth-card"><div className="auth-brand"><div className="brand-mark">L</div><div><strong>loop</strong><span>workplace</span></div></div><div className="auth-copy"><span className="overline">Kartuli Labs workspace</span><h1>{isRegistering ? 'Create your account' : 'Welcome back'}</h1><p>{isRegistering ? 'Set up your account to start booking rooms.' : 'Sign in to manage your meetings and rooms.'}</p></div><form className="auth-form" onSubmit={submit}>{isRegistering && <label className="form-field"><span>Full name</span><input autoFocus value={name} onChange={(event) => setName(event.target.value)} placeholder="e.g. Nino Chkheidze" autoComplete="name" required /></label>}<label className="form-field"><span>Email address</span><input autoFocus={!isRegistering} type="email" value={email} onChange={(event) => setEmail(event.target.value)} placeholder="you@kartulilabs.com" autoComplete="email" required /></label><label className="form-field"><span>Password</span><input type="password" value={password} onChange={(event) => setPassword(event.target.value)} placeholder="At least 8 characters" autoComplete={isRegistering ? 'new-password' : 'current-password'} minLength={8} maxLength={128} required /></label>{isRegistering && <label className="form-field"><span>Confirm password</span><input type="password" value={confirmPassword} onChange={(event) => setConfirmPassword(event.target.value)} placeholder="Repeat your password" autoComplete="new-password" minLength={8} maxLength={128} required /></label>}{error && <div className="form-error" role="alert">{error}</div>}<button className="button button-primary auth-submit" type="submit" disabled={busy}>{busy ? (isRegistering ? 'Creating account…' : 'Signing in…') : (isRegistering ? 'Create account' : 'Sign in')}<ChevronRightIcon size={16} /></button></form><p className="auth-switch">{isRegistering ? 'Already have an account?' : 'New to Loop?'} <button type="button" onClick={() => { setMode(isRegistering ? 'login' : 'register'); setError('') }}>{isRegistering ? 'Sign in' : 'Create an account'}</button></p><p className="auth-footnote">{useLocalApi ? 'Changes stay in this browser so the app can run on Vercel without a server.' : 'Your session is protected with an HttpOnly cookie.'}</p></section></main>
+  const heading = isReset ? 'Choose a new password' : isForgot ? 'Reset your password' : isRegistering ? 'Create your account' : 'Welcome back'
+  const copy = isReset
+    ? 'Enter a new password for your Loop account.'
+    : isForgot
+      ? 'We will email you a secure link to reset your password.'
+      : isRegistering
+        ? 'Set up your account to start booking rooms.'
+        : 'Sign in to manage your meetings and rooms.'
+
+  return <main className="auth-shell"><section className="auth-card"><div className="auth-brand"><div className="brand-mark">L</div><div><strong>loop</strong><span>workplace</span></div></div><div className="auth-copy"><span className="overline">Kartuli Labs workspace</span><h1>{heading}</h1><p>{copy}</p></div>{notice && <div className="auth-notice" role="status">{notice}</div>}<form className="auth-form" onSubmit={submit}>{isRegistering && <label className="form-field"><span>Full name</span><input autoFocus value={name} onChange={(event) => setName(event.target.value)} placeholder="e.g. Nino Chkheidze" autoComplete="name" required /></label>}{!isReset && <label className="form-field"><span>Email address</span><input autoFocus={!isRegistering && !isReset} type="email" value={email} onChange={(event) => setEmail(event.target.value)} placeholder="you@kartulilabs.com" autoComplete="email" required={!isReset} readOnly={isReset} /></label>}<label className="form-field"><span>{isReset ? 'New password' : 'Password'}</span><input autoFocus={isReset} type="password" value={password} onChange={(event) => setPassword(event.target.value)} placeholder="At least 8 characters" autoComplete={isRegistering || isReset ? 'new-password' : 'current-password'} minLength={8} maxLength={128} required /></label>{(isRegistering || isReset) && <label className="form-field"><span>Confirm password</span><input type="password" value={confirmPassword} onChange={(event) => setConfirmPassword(event.target.value)} placeholder="Repeat your password" autoComplete="new-password" minLength={8} maxLength={128} required /></label>}{error && <div className="form-error" role="alert">{error}</div>}<button className="button button-primary auth-submit" type="submit" disabled={busy}>{busy ? 'Please wait…' : isReset ? 'Update password' : isForgot ? 'Send reset link' : isRegistering ? 'Create account' : 'Sign in'}<ChevronRightIcon size={16} /></button></form><p className="auth-switch">{isForgot || isReset ? <button type="button" onClick={() => { setMode('login'); setError(''); setNotice('') }}>Back to sign in</button> : isRegistering ? <>Already have an account? <button type="button" onClick={() => { setMode('login'); setError('') }}>Sign in</button></> : <>New to Loop? <button type="button" onClick={() => { setMode('register'); setError('') }}>Create an account</button> · <button type="button" onClick={() => { setMode('forgot'); setError(''); setNotice('') }}>Forgot password?</button></>}</p><p className="auth-footnote">{useLocalApi ? 'Bookings stay in this browser. Email delivery uses Vercel serverless when configured.' : 'Your session is protected with an HttpOnly cookie.'}</p></section></main>
+}
+
+function VerifyEmailScreen({ user, onLogout, initialNotice, onClearNotice }: { user: AuthUser; onLogout: () => Promise<void>; initialNotice?: string | null; onClearNotice?: () => void }) {
+  const [notice, setNotice] = useState(initialNotice || '')
+  const [error, setError] = useState('')
+  const [busy, setBusy] = useState(false)
+
+  useEffect(() => {
+    if (initialNotice) setNotice(initialNotice)
+  }, [initialNotice])
+
+  const handleResend = async () => {
+    if (busy) return
+    setBusy(true)
+    setError('')
+    setNotice('')
+    onClearNotice?.()
+    try {
+      const result = await resendVerification()
+      setNotice(result.sent === false && !useLocalApi ? 'Email service is not configured. Check server logs for the verification link.' : 'Verification email sent. Check your inbox.')
+    } catch (resendError) {
+      setError(resendError instanceof Error ? resendError.message : 'We could not resend the email.')
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  return <main className="auth-shell"><section className="auth-card verify-card"><div className="auth-brand"><div className="brand-mark">L</div><div><strong>loop</strong><span>workplace</span></div></div><div className="auth-copy"><span className="overline">Almost there</span><h1>Verify your email</h1><p>We sent a verification link to <strong>{user.email}</strong>. Confirm your address to book rooms and receive booking updates.</p></div>{notice && <div className="auth-notice" role="status">{notice}</div>}{error && <div className="form-error" role="alert">{error}</div>}<div className="verify-actions"><button type="button" className="button button-primary" onClick={handleResend} disabled={busy}>{busy ? 'Sending…' : 'Resend verification email'}</button><button type="button" className="button button-secondary" onClick={() => onLogout()}>Sign out</button></div><p className="auth-footnote">Didn’t get the email? Check spam, or use resend. In local dev without Resend, open the browser console for the verification link.</p></section></main>
 }
 
 function ErrorState({ message, onRetry, onLogout }: { message: string; onRetry: () => void; onLogout: () => void }) {
