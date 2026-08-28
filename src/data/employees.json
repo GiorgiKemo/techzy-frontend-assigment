@@ -1,0 +1,8 @@
+[
+  { "id": "mariam-kiknadze", "name": "Mariam Kiknadze", "role": "Product design", "initials": "MK", "color": "#d9c9f0" },
+  { "id": "giorgi-maisuradze", "name": "Giorgi Maisuradze", "role": "Engineering", "initials": "GM", "color": "#c9e5e2" },
+  { "id": "nino-chkheidze", "name": "Nino Chkheidze", "role": "People operations", "initials": "NC", "color": "#f1d2b9" },
+  { "id": "levan-beridze", "name": "Levan Beridze", "role": "Marketing", "initials": "LB", "color": "#d9e4b7" },
+  { "id": "ana-kapanadze", "name": "Ana Kapanadze", "role": "Sales", "initials": "AK", "color": "#f0cdd3" },
+  { "id": "davit-japaridze", "name": "Davit Japaridze", "role": "Finance", "initials": "DJ", "color": "#cbd9ef" }
+]

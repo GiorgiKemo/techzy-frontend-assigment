@@ -1,0 +1,10 @@
+[
+  { "id": "room-atlas", "name": "Mtkwari", "floor": "Floor 01", "location": "Saburtalo", "capacity": 8, "type": "Meeting", "amenities": ["Video calls", "Whiteboard", "Display"], "color": "#d7e8d2" },
+  { "id": "room-orbit", "name": "Narikala", "floor": "Floor 01", "location": "Saburtalo", "capacity": 12, "type": "Meeting", "amenities": ["Video calls", "Display", "Catering"], "color": "#d8e4f7" },
+  { "id": "room-canyon", "name": "Kazbegi", "floor": "Floor 02", "location": "Vake", "capacity": 6, "type": "Focus", "amenities": ["Display", "Quiet zone"], "color": "#f0dfc8" },
+  { "id": "room-studio", "name": "Laguna", "floor": "Floor 02", "location": "Vake", "capacity": 18, "type": "Workshop", "amenities": ["Video calls", "Whiteboard", "Catering"], "color": "#e5d8ef" },
+  { "id": "room-grove", "name": "Vera", "floor": "Floor 03", "location": "Rustaveli Avenue", "capacity": 10, "type": "Meeting", "amenities": ["Video calls", "Whiteboard"], "color": "#d8eee9" },
+  { "id": "room-summit", "name": "Mtatsminda", "floor": "Floor 03", "location": "Rustaveli Avenue", "capacity": 22, "type": "Workshop", "amenities": ["Video calls", "Display", "Whiteboard", "Catering"], "color": "#f1dfdf" },
+  { "id": "room-nook", "name": "Bambis Rigi", "floor": "Floor 03", "location": "Rustaveli Avenue", "capacity": 2, "type": "Focus", "amenities": ["Quiet zone"], "color": "#f1eccf" },
+  { "id": "room-lighthouse", "name": "Sololaki", "floor": "Floor 04", "location": "Sololaki", "capacity": 14, "type": "Meeting", "amenities": ["Video calls", "Display", "Whiteboard"], "color": "#dce3ed" }
+]
