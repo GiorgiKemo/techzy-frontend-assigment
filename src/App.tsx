@@ -392,11 +392,14 @@ function MetricCard({ label, value, detail, trend, trendLabel, icon, trendDirect
 }
 
 function RoomsPage({ data, selectedDate, onCreate, onSelectBooking }: { data: AppData; selectedDate: string; onCreate: (roomId?: string, date?: string) => void; onSelectBooking: (booking: Booking) => void }) {
-  const [query, setQuery] = useState('')
-  const [type, setType] = useState<'All types' | Room['type']>('All types')
-  const [capacity, setCapacity] = useState('Any capacity')
-  const [location, setLocation] = useState('All locations')
   const locations = useMemo(() => ['All locations', ...Array.from(new Set(data.rooms.map((room) => room.location)))], [data.rooms])
+  const [query, setQuery] = useState(() => getUrlParam('roomsSearch'))
+  const [type, setType] = useState<RoomFilterType>(getRoomTypeFromUrl)
+  const [capacity, setCapacity] = useState(getRoomCapacityFromUrl)
+  const [location, setLocation] = useState(() => locations.includes(getUrlParam('roomsLocation')) ? getUrlParam('roomsLocation') : 'All locations')
+  useEffect(() => {
+    replaceUrlParams({ roomsSearch: query, roomsType: type, roomsCapacity: capacity, roomsLocation: location })
+  }, [capacity, location, query, type])
   const filteredRooms = data.rooms.filter((room) => {
     const matchesQuery = `${room.name} ${room.floor} ${room.location} ${room.amenities.join(' ')}`.toLowerCase().includes(query.toLowerCase())
     const matchesType = type === 'All types' || room.type === type
@@ -423,15 +426,14 @@ function RoomCard({ room, bookings, selectedDate, onCreate, onSelectBooking }: {
 
 function SchedulePage({ data, selectedDate, setSelectedDate, onCreate, onSelectBooking }: { data: AppData; selectedDate: string; setSelectedDate: (date: string) => void; onCreate: (roomId?: string, date?: string) => void; onSelectBooking: (booking: Booking) => void }) {
   const [mode, setMode] = useState<'day' | 'week'>(getRangeFromUrl)
-  const [roomFilter, setRoomFilter] = useState('All rooms')
+  const roomOptions = useMemo(() => ['All rooms', ...data.rooms.map((room) => room.id)], [data.rooms])
+  const [roomFilter, setRoomFilter] = useState(() => roomOptions.includes(getUrlParam('scheduleRoom')) ? getUrlParam('scheduleRoom') : 'All rooms')
   const scheduleBookings = data.bookings.filter((booking) => booking.status !== 'cancelled' && (roomFilter === 'All rooms' || booking.roomId === roomFilter))
   const displayedRooms = roomFilter === 'All rooms' ? data.rooms : data.rooms.filter((room) => room.id === roomFilter)
   const weekDates = getWeekDates(selectedDate)
   useEffect(() => {
-    const params = new URLSearchParams(window.location.search)
-    params.set('range', mode)
-    window.history.replaceState({}, '', `${window.location.pathname}?${params.toString()}`)
-  }, [mode])
+    replaceUrlParams({ range: mode, scheduleRoom: roomFilter })
+  }, [mode, roomFilter])
   return <>
     <div className="page-heading schedule-heading"><div><span className="overline">Plan your week</span><h1>Schedule</h1><p>See what’s happening across every room.</p></div><button type="button" className="button button-primary" onClick={() => onCreate(undefined, selectedDate)}><PlusIcon size={17} /> New booking</button></div>
     <div className="schedule-toolbar"><div className="view-toggle" role="group" aria-label="Schedule range"><button type="button" className={mode === 'day' ? 'active' : ''} aria-pressed={mode === 'day'} onClick={() => setMode('day')}>Day</button><button type="button" className={mode === 'week' ? 'active' : ''} aria-pressed={mode === 'week'} onClick={() => setMode('week')}>Week</button></div><div className="date-switcher"><button type="button" onClick={() => setSelectedDate(addDays(selectedDate, mode === 'week' ? -7 : -1))} aria-label="Previous date"><ChevronLeftIcon size={17} /></button><strong>{mode === 'day' ? formatDate(selectedDate, { weekday: 'long', month: 'long', day: 'numeric' }) : `${formatDate(weekDates[0], { month: 'short', day: 'numeric' })} – ${formatDate(weekDates[6], { month: 'short', day: 'numeric', year: 'numeric' })}`}</strong><button type="button" onClick={() => setSelectedDate(addDays(selectedDate, mode === 'week' ? 7 : 1))} aria-label="Next date"><ChevronRightIcon size={17} /></button><button type="button" className="today-button" onClick={() => setSelectedDate(getTodayDate())}>Today</button></div><FilterSelect value={roomFilter} onChange={setRoomFilter} options={['All rooms', ...data.rooms.map((room) => room.id)]} labels={['All rooms', ...data.rooms.map((room) => room.name)]} ariaLabel="Filter schedule by room" /></div>
@@ -448,9 +450,12 @@ function WeekSchedule({ dates, rooms, bookings, onSelectBooking }: { dates: stri
 }
 
 function BookingsPage({ data, onCreate, onSelectBooking, onEdit, onCancel }: { data: AppData; onCreate: () => void; onSelectBooking: (booking: Booking) => void; onEdit: (booking: Booking) => void; onCancel: (booking: Booking) => void }) {
-  const [query, setQuery] = useState('')
-  const [status, setStatus] = useState<'All bookings' | 'Upcoming' | 'Past' | 'Cancelled'>('All bookings')
-  const [sortDescending, setSortDescending] = useState(false)
+  const [query, setQuery] = useState(() => getUrlParam('bookingsSearch'))
+  const [status, setStatus] = useState<BookingFilterStatus>(getBookingStatusFromUrl)
+  const [sortDescending, setSortDescending] = useState(() => getUrlParam('bookingsSort') === 'desc')
+  useEffect(() => {
+    replaceUrlParams({ bookingsSearch: query, bookingsStatus: status, bookingsSort: sortDescending ? 'desc' : 'asc' })
+  }, [query, sortDescending, status])
   const filtered = data.bookings.filter((booking) => {
     const room = findRoom(data, booking.roomId)
     const organizer = findEmployee(data, booking.organizerId)
@@ -587,8 +592,23 @@ function bookingStyle(booking: Booking): CSSProperties {
   const width = Math.min(100 - left, (duration / 600) * 100)
   return { left: `${left}%`, width: `${Math.max(width, 2)}%` }
 }
-function getViewFromUrl(): ViewName { const view = new URLSearchParams(window.location.search).get('view'); return NAV_ITEMS.some((item) => item.id === view) ? view as ViewName : 'dashboard' }
-function getRangeFromUrl(): 'day' | 'week' { return new URLSearchParams(window.location.search).get('range') === 'week' ? 'week' : 'day' }
+type RoomFilterType = 'All types' | Room['type']
+type BookingFilterStatus = 'All bookings' | 'Upcoming' | 'Past' | 'Cancelled'
+
+function getUrlParam(key: string) { return new URLSearchParams(window.location.search).get(key) || '' }
+function replaceUrlParams(updates: Record<string, string>) {
+  const params = new URLSearchParams(window.location.search)
+  Object.entries(updates).forEach(([key, value]) => {
+    if (value) params.set(key, value)
+    else params.delete(key)
+  })
+  window.history.replaceState({}, '', `${window.location.pathname}${params.toString() ? `?${params.toString()}` : ''}`)
+}
+function getViewFromUrl(): ViewName { const view = getUrlParam('view'); return NAV_ITEMS.some((item) => item.id === view) ? view as ViewName : 'dashboard' }
+function getRangeFromUrl(): 'day' | 'week' { return getUrlParam('range') === 'week' ? 'week' : 'day' }
+function getRoomTypeFromUrl(): RoomFilterType { const type = getUrlParam('roomsType') as RoomFilterType; return ['All types', 'Meeting', 'Workshop', 'Focus'].includes(type) ? type : 'All types' }
+function getRoomCapacityFromUrl() { const capacity = getUrlParam('roomsCapacity'); return ['Any capacity', '2', '6', '10', '14'].includes(capacity) ? capacity : 'Any capacity' }
+function getBookingStatusFromUrl(): BookingFilterStatus { const status = getUrlParam('bookingsStatus') as BookingFilterStatus; return ['All bookings', 'Upcoming', 'Past', 'Cancelled'].includes(status) ? status : 'All bookings' }
 function getDateFromUrl(): string {
   const date = new URLSearchParams(window.location.search).get('date')
   return date && /^\d{4}-\d{2}-\d{2}$/.test(date) && !Number.isNaN(parseDate(date).getTime()) ? date : getTodayDate()

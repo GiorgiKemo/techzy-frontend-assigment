@@ -472,8 +472,8 @@ app.post('/api/auth/verify-email', limitAuth, asyncHandler(async (req, res) => {
     return { user: nextUser }
   })
   if (verified.invalid) return res.status(400).json({ message: 'Verification link is invalid or expired.' })
-  const token = createSession(verified.user.id)
-  setSessionCookie(res, token)
+  const sessionToken = createSession(verified.user.id)
+  setSessionCookie(res, sessionToken)
   return res.json(publicUser(verified.user))
 }))
 

@@ -2,6 +2,11 @@
 
 Internal meeting-room booking for Kartuli Labs employees. The interface is English; Georgian people, rooms, and places use Latin transliteration (for example Nino Chkheidze, Mtkwari, Narikala, and Saburtalo).
 
+## Assignment links
+
+- Repository: https://github.com/GiorgiKemo/techzy-frontend-assigment
+- Deployed application: https://techzy-frontend-assigment.vercel.app/
+
 ## Run locally
 
 ```bash
@@ -70,7 +75,7 @@ Vercel serverless routes (`/api/email/send-verification`, `/api/email/send-passw
 
 ## Product notes
 
-- Dashboard, rooms directory, daily/weekly schedule, booking list, booking detail, create/edit form, cancellation, filters, URL state (`view`, `date`, `range`), mobile navigation, and responsive layouts are implemented.
+- Dashboard, rooms directory, daily/weekly schedule, booking list, booking detail, create/edit form, cancellation, filters, URL state (`view`, `date`, `range`, room filters, booking filters, and sort order), mobile navigation, and responsive layouts are implemented.
 - **Email verification** is required before booking. New accounts see a verify-pending screen with resend support. Links use `?verify=token`.
 - **Password reset** uses `?reset=token` links from email. Forgot-password responses are generic (no email enumeration).
 - **Booking emails** go to the organizer when they are a registered user with a verified email (created, updated, cancelled).
